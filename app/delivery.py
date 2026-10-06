@@ -359,3 +359,55 @@ class DeliveryManager:
                 "server_time": now.isoformat(),
                 "channels": channels,
             }
+
+    # ------------------------------------------------------------------ #
+    # Read-only version snapshot (version-diff dry run; never mutates)
+    # ------------------------------------------------------------------ #
+    def version_view(self, stored) -> dict | None:
+        """Return a *read-only* delivery snapshot for ``stored.version``.
+
+        ``None`` means the version is not the currently served version (it was
+        superseded by a republish or the hall was deleted): its queue is gone and
+        every unacknowledged task of it is void. For the current version the
+        snapshot mirrors the live FIFO queues without changing heads, leases or
+        tokens — the version-diff dry run reads it exclusively.
+        """
+        with self._lock:
+            queue = self._queues.get(stored.spec.id)
+            if queue is None or queue.version != stored.version:
+                return None
+            now = utc_now()
+            channels: dict[str, list[dict]] = {}
+            for channel in queue.order:
+                cq = queue.channels[channel]
+                entries: list[dict] = []
+                for seq, cmd in enumerate(cq.entries):
+                    lease = cq.lease if cq.head == seq else None
+                    if seq < cq.head:
+                        state = "acked"
+                    elif lease is not None and lease.is_live(now):
+                        state = "leased_live"
+                    elif lease is not None:
+                        state = "leased_expired"
+                    else:
+                        state = "waiting"
+                    entries.append(
+                        {
+                            "seq": seq,
+                            "at": cmd["at"],
+                            "type": cmd["type"],
+                            "scene_id": cmd["scene_id"],
+                            "state": state,
+                            "task_id": task_ident(
+                                queue.hall_id, queue.version, channel, seq
+                            ),
+                        }
+                    )
+                channels[channel] = entries
+            return {
+                "hall_id": queue.hall_id,
+                "version": queue.version,
+                "published_at": queue.published_at,
+                "server_time": now,
+                "channels": channels,
+            }

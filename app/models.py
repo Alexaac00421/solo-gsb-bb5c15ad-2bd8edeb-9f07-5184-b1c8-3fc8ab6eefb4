@@ -122,3 +122,23 @@ class AckIn(BaseModel):
 
     task_id: Annotated[str, Field(min_length=1, max_length=160, examples=["bronze-gallery:v1:lamp-case-1:000000"])]
     lease_token: Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class VersionRef(BaseModel):
+    """One side of a version-comparison dry run: hall plus an existing version."""
+
+    hall_id: Annotated[str, Field(min_length=1, max_length=64, examples=["bronze-gallery"])]
+    version: Annotated[int, Field(ge=1, description="An already published version number of the hall.")]
+
+
+class VersionDiffIn(BaseModel):
+    """Request for a published-version comparison *rehearsal*.
+
+    The two referenced versions must both exist, must belong to the same hall
+    and must not be identical; otherwise the rehearsal is rejected. The call is
+    strictly read-only — it never changes the stored orchestration, delivery
+    queues or leases.
+    """
+
+    base: VersionRef = Field(description="The 'from' side (typically the version currently in effect).")
+    target: VersionRef = Field(description="The 'to' side being evaluated.")

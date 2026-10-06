@@ -52,6 +52,8 @@ pytest -q
 | `POST` | `/validate` | 只校验/试编译（dry run），不落库 |
 | `GET` | `/halls` | 列出已保存展厅 |
 | `GET` | `/halls/{hall_id}` | 获取编译后的完整计划 |
+| `GET` | `/halls/{hall_id}/versions` | 列出该展厅保留的所有已发布版本（供对比预演取号） |
+| `POST` | `/halls/version-diff` | **两个已发布版本的差异预演**（只读，按通道+执行时间配对） |
 | `GET` | `/halls/{hall_id}/timeline` | 只取每通道可执行时间线 |
 | `GET` | `/halls/{hall_id}/state?at=...` | 模拟某时刻各通道的实际亮度/生效场景 |
 | `POST` | `/halls/{hall_id}/commands/claim` | **网关按通道领取已到期指令**（租约 + 稳定任务标识） |
@@ -59,7 +61,7 @@ pytest -q
 | `GET` | `/halls/{hall_id}/delivery` | 查看每通道投递/租约进度（运维视图） |
 | `DELETE` | `/halls/{hall_id}` | 删除编排 |
 
-数据为**内存存储**（线程安全，单 worker），重启清空；如需多实例持久化可将 `app/store.py` 替换为 Redis/数据库实现，`app/engine.py` 是纯函数、与存储无关。
+数据为**内存存储**（线程安全，单 worker），重启清空；如需多实例持久化可将 `app/store.py` 替换为 Redis/数据库实现，`app/engine.py` 是纯函数、与存储无关。每次成功发布都会保留该版本快照（同样位于内存，删除展厅即清空），用于下文的版本对比预演。
 
 ### 数据模型要点
 
@@ -286,6 +288,168 @@ curl -sS -X POST http://localhost:8080/halls/batch-publish \
 
 ---
 
+## 已发布版本对比预演（运营只读）
+
+运营人员在切换编排前，先对**同一展厅的两个已存在发布版本**做一次「差异预演」：服务端取两个版本当时编译好的时间线快照，**按通道、按执行时间**把指令配对，输出新增、移除与属性变化，并标注**紧急抢占**与**发布水位过滤**对网关投递的影响。预演是**纯只读**操作——不修改当前编排、不重建/推进投递队列、不签发或失效任何租约。
+
+### 取版本号：`GET /halls/{hall_id}/versions`
+
+```bash
+curl -sS http://localhost:8080/halls/bronze-gallery/versions | jq
+```
+
+```json
+{
+  "hall_id": "bronze-gallery",
+  "current_version": 2,
+  "count": 2,
+  "versions": [
+    {"version": 1, "current": false, "published_at": "2026-10-06T07:00:00+00:00", "commands": 13, "...": "..."},
+    {"version": 2, "current": true,  "published_at": "2026-10-06T09:30:00+00:00", "commands": 13, "...": "..."}
+  ]
+}
+```
+
+### 15. 预演两个版本的差异：`POST /halls/version-diff`
+
+请求体（[`examples/version-diff.json`](examples/version-diff.json)）给两个版本引用，方向为 **base（旧/当前）→ target（待切换）**：
+
+```bash
+curl -sS -X POST http://localhost:8080/halls/version-diff \
+  -H 'Content-Type: application/json' \
+  --data @examples/version-diff.json | jq
+```
+
+**配对规则**：先按通道分组、再按指令执行时刻 `at` 聚合；同一时刻优先按 `(type, scene_id)` 配对（同一个场景的 fade 仍是同一个槽位），剩余指令按时间线顺序两两配对——同一时刻普通 `fade` 变成 `emergency_enter` 也只产生**一条 `changed`**（变化字段里含 `type`/`priority`/`scene_id`），配不上的才是 `added`/`removed`。
+
+响应结构（节选）：
+
+```json
+{
+  "dry_run": true,
+  "mutates": "nothing: stored orchestration, delivery queues and leases are untouched",
+  "hall_id": "bronze-gallery",
+  "base":   {"version": 1, "published_at": "2026-10-06T07:00:00+00:00", "summary": {"commands": 13}},
+  "target": {"version": 2, "published_at": "2026-10-06T09:30:00+00:00", "summary": {"commands": 13}},
+  "summary": {
+    "channels_compared": 3, "channels_added": [], "channels_removed": [],
+    "added": 4, "removed": 4, "changed": 2, "unchanged": 7,
+    "fields_changed": {"to_level": 1, "fade_seconds": 1, "fade_end_at": 1, "from_level": 1},
+    "preemption_windows": {"added": 2, "removed": 2, "changed": 0},
+    "suppression_changes": 0
+  },
+  "preemption_changes": {"added": [], "removed": [], "changed": []},
+  "delivery_impact": {
+    "base":   {"version": 1, "is_current_version": false, "eligible_commands": 13,
+               "watermark_filtered_commands": 0, "states": {"acked": 0, "leased_live": 0, "leased_expired": 0, "waiting": 0, "undue": 0},
+               "outstanding_tasks": 0},
+    "target": {"version": 2, "is_current_version": true,  "eligible_commands": 10,
+               "watermark_filtered_commands": 3, "states": {"acked": 0, "leased_live": 0, "leased_expired": 0, "waiting": 10, "undue": 0},
+               "outstanding_tasks": 10},
+    "entries_with_outstanding_base_task": 0,
+    "entries_touching_watermark_filter": 3,
+    "entries_involving_emergency_preemption": 4
+  },
+  "channels": [
+    {
+      "channel": "lamp-case-1",
+      "present_in": {"base": true, "target": true},
+      "default_level": {"base": 0, "target": 0},
+      "summary": {"base_commands": 5, "target_commands": 5, "added": 2, "removed": 2, "changed": 1, "unchanged": 0,
+                  "fields_changed": {"to_level": 1, "fade_seconds": 1, "fade_end_at": 1}, "suppression_changes": 0},
+      "entries": [
+        {
+          "kind": "added", "at": "2026-10-06T09:45:00+00:00",
+          "base": null,
+          "target": {"type": "emergency_enter", "to_level": 5.0, "scene_id": "conservation-alert", "priority": "emergency"},
+          "changes": [],
+          "preemption": {
+            "base": null,
+            "target": {"emergency_command": true, "preempts_normal": true,
+                       "preemption": {"emergency_scene_id": "conservation-alert", "restored_scene_id": "morning-open",
+                                      "restored_level": 60.0, "skipped_scene_ids": []}}
+          },
+          "delivery": {
+            "base": null,
+            "target": {"eligible": true, "before_watermark": false, "state": "waiting", "sequence": 1,
+                       "task_id": "bronze-gallery:v2:lamp-case-1:000001", "deliverable": false, "due": false}
+          },
+          "delivery_impact": {
+            "effect": "new_delivery", "reasons": [],
+            "outstanding_base_task": false, "preemption_involved": true, "watermark_filtered": false
+          }
+        },
+        {
+          "kind": "changed", "at": "2026-10-06T12:00:00+00:00",
+          "base":   {"type": "fade", "to_level": 90.0, "fade_seconds": 120.0, "scene_id": "noon-bright"},
+          "target": {"type": "fade", "to_level": 95.0, "fade_seconds": 60.0,  "scene_id": "noon-bright"},
+          "changes": [
+            {"field": "to_level",     "from": 90.0, "to": 95.0},
+            {"field": "fade_seconds", "from": 120.0, "to": 60.0},
+            {"field": "fade_end_at",  "from": "2026-10-06T12:02:00+00:00", "to": "2026-10-06T12:01:00+00:00"}
+          ],
+          "delivery_impact": {"effect": "base_task_already_void", "reasons": ["base_version_already_superseded"],
+                              "outstanding_base_task": false, "preemption_involved": false, "watermark_filtered": false}
+        }
+      ],
+      "suppression_changes": []
+    }
+  ]
+}
+```
+
+**每条 `entries[]` 的含义**：
+
+- `kind`：`added`（target 新指令）/ `removed`（base 有而 target 无）/ `changed`（同一槽位属性变化）/ `unchanged`。
+- `changes[]` 逐字段列出差异：`to_level`（亮度）、`fade_seconds`/`fade_end_at`（渐变）、`priority`（优先级）、`type`（fade↔紧急进出）、`scene_id`（换了场景）、`restored_scene_id`（释放时恢复目标）、`from_level`（由上游关键帧级联出的起始亮度）。
+- `preemption`：该槽位是否为紧急指令（`emergency_enter`/`emergency_exit`），并回挂对应的抢占窗口（恢复到哪个普通场景、恢复亮度、跳过了哪些普通场景）。
+- `delivery`：相对**该侧版本自己的发布水位**（`published_at`）与实时投递队列的只读快照：
+  - `before_watermark=true` / `state="filtered_by_watermark"`：执行时刻早于发布水位，发布规则**永不补发**；
+  - 当前版本还会给出队列实时状态 `acked` / `leased_live` / `leased_expired` / `waiting`（未到点为 `undue`）及 `task_id`；
+  - 非当前版本 `state="version_superseded"`：队列已随重新发布销毁，其未确认任务早已失效。
+- `delivery_impact.effect` 给出对投递的直接结论，例如：
+  - `new_delivery` / `delivery_removed`：新增/减少一次实际投递；
+  - `not_delivered_watermark_filtered`：target 新增的指令落在水位之前，切过去也不会下发；
+  - `outstanding_base_task_replaced_on_republish`：base 还有**已领取未确认或排队中**的指令，重新发布即作废（这正是网关之后会收到 `410 version_expired` 的那些任务）；
+  - `already_delivered_ack_remains` / `already_delivered_change_only_affects_future`：指令已确认，改动只影响未来；
+  - `base_task_already_void` / `base_version_already_superseded`：base 已不是当前版本，队列已失效；
+  - `no_change`：槽位完全一致。
+
+**紧急抢占导致的投递影响**除槽位标注外还在两处汇总：
+
+- `channels[].suppression_changes[]`：普通场景激活在一侧被紧急窗口压住、另一侧没有（`suppressed` / `released`），或压住它的紧急场景换了（`preemptor_changed`），带 `scheduled_at` 与 `preempted_by`；
+- `preemption_changes`：按 `(channel, emergency_scene_id, from)` 配对的紧急窗口 `added`/`removed`/`changed`，`changed.fields` 标出 `restored_level`（释放恢复亮度变化）、`restored_scene_id`（恢复目标场景变化）、`skipped_scene_ids`（被跳过的普通场景集合变化）、`window_to`（释放时刻变化）。
+
+### 16. 拒绝规则
+
+| 情况 | 状态码 | 错误码 |
+| --- | --- | --- |
+| 任一引用版本在该展厅不存在（两个都不存在会一起返回，带 `which: base/target`） | `404` | `version_not_found` |
+| 两个引用分属不同展厅 | `422` | `hall_mismatch` |
+| 两个引用指向同一版本号 | `422` | `same_version` |
+| `version < 1`、字段缺失/类型错误 | `422` | Pydantic 字段错误 |
+
+```bash
+# 版本不存在
+curl -sS -X POST http://localhost:8080/halls/version-diff -H 'Content-Type: application/json' \
+  -d '{"base":{"hall_id":"bronze-gallery","version":1},"target":{"hall_id":"bronze-gallery","version":9}}'
+# HTTP 404 -> {"ok": false, "errors": [{"which": "target", "code": "version_not_found", ...}]}
+
+# 展厅不一致
+curl -sS -X POST http://localhost:8080/halls/version-diff -H 'Content-Type: application/json' \
+  -d '{"base":{"hall_id":"bronze-gallery","version":1},"target":{"hall_id":"porcelain-hall","version":2}}'
+# HTTP 422 -> {"errors": [{"code": "hall_mismatch", "base_hall_id": "bronze-gallery", "target_hall_id": "porcelain-hall"}]}
+
+# 版本号相同
+curl -sS -X POST http://localhost:8080/halls/version-diff -H 'Content-Type: application/json' \
+  -d '{"base":{"hall_id":"bronze-gallery","version":2},"target":{"hall_id":"bronze-gallery","version":2}}'
+# HTTP 422 -> {"errors": [{"code": "same_version", "version": 2}]}
+```
+
+预演可反复调用、方向可反（`base`/`target` 对调即得到反向 diff，`changes[].from/to` 随之对调）；删除展厅会同时丢弃其全部历史版本，之后对比返回 `404`。
+
+---
+
 ## 网关投递：按通道领取 / 确认到期指令（租约队列）
 
 灯光网关（DMX/调光网关）通过两个接口把**已发布版本**的指令拉到设备上执行。投递是**按通道（灯具）**、**按执行时间顺序**的严格 FIFO，并在其外叠加一层「租约 / 可见性超时」：
@@ -458,21 +622,24 @@ loop:
 
 ```
 app/
-  models.py     # Pydantic 输入模型（含 BatchPublishIn、ClaimIn、AckIn）与时间归一化
+  models.py     # Pydantic 输入模型（含 BatchPublishIn、ClaimIn、AckIn、VersionDiffIn）与时间归一化
   clock.py      # 可注入 UTC 时钟（生产读墙钟，测试可冻结/推进时间）
   engine.py     # 纯函数：校验 + 时间线合成（抢占/恢复/跳过）
+  diff.py       # 纯函数：已发布版本对比预演（按通道/执行时间配对 + 抢占/水位投递影响）
   simulator.py  # 任意时刻的通道状态模拟
-  store.py      # 线程安全内存存储：单展厅 put 与批量原子 batch_commit（乐观版本检查）
-  delivery.py   # 网关投递队列：按通道 FIFO、租约/令牌、发布水位与版本失效
-  main.py       # FastAPI 路由（单展厅 + 批量发布 + commands/claim、commands/ack、delivery）
+  store.py      # 线程安全内存存储：单展厅 put、批量原子 batch_commit 与历史版本保留（乐观版本检查）
+  delivery.py   # 网关投递队列：按通道 FIFO、租约/令牌、发布水位与版本失效（含只读 version_view）
+  main.py       # FastAPI 路由（单展厅 + 批量发布 + commands/claim、commands/ack、delivery、version-diff）
 tests/
   test_api.py       # 34 个端到端用例（单展厅 + 批量发布，含并发）
   test_delivery.py  # 23 个网关投递用例（领取/租约/确认/版本失效/并发）
+  test_diff.py      # 23 个版本对比预演用例（配对/抢占/水位/拒绝/只读保证）
 examples/
   bronze-gallery.json
   batch-publish.json   # 批量发布请求示例（更新 + 新建）
   gateway-claim.json   # 网关领取请求体
   gateway-ack.json     # 网关确认请求体（task_id + lease_token）
+  version-diff.json    # 版本对比预演请求体（base + target 版本引用）
 Dockerfile
 docker-compose.yml
 requirements.txt

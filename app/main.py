@@ -8,19 +8,24 @@ from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
 from .delivery import DeliveryManager
-from .models import AckIn, BatchPublishIn, ClaimIn, HallIn, as_utc
+from .diff import Side, diff_plans
+from .models import AckIn, BatchPublishIn, ClaimIn, HallIn, VersionDiffIn, as_utc
 from .simulator import simulate
+from .clock import utc_now
 from .store import StoredHall, store
 
 app = FastAPI(
     title="Museum Lighting Orchestration API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Compile scheduled light scenes into an executable per-channel timeline. "
         "Validates lamp references, brightness ranges and non-overlapping fade intervals; "
         "emergency scenes preempt normal scenes and release only to scenes still in window. "
         "Gateways claim due commands per channel under a lease and confirm them with the "
-        "current lease token; republishing or deleting a hall invalidates the old version."
+        "current lease token; republishing or deleting a hall invalidates the old version. "
+        "Operations can rehearse a read-only diff (adds/removes/level/fade/priority changes "
+        "plus preemption and publish-watermark delivery impact) between any two retained "
+        "published versions of one hall via POST /halls/version-diff."
     ),
 )
 
@@ -286,6 +291,145 @@ def get_state(
     stored = _stored_or_404(hall_id)
     t = as_utc(at) if at is not None else datetime.now(timezone.utc)
     return simulate(stored.plan, t)
+
+
+@app.get(
+    "/halls/{hall_id}/versions",
+    tags=["halls"],
+    summary="List retained published versions (for comparison rehearsals)",
+)
+def list_versions(hall_id: str) -> dict:
+    """Every published version still retained for a hall, oldest first.
+
+    Version numbers are the same values returned by the publish endpoints; the
+    current (served) version is flagged. Use two of these numbers as input to
+    ``POST /halls/version-diff``.
+    """
+    stored = _stored_or_404(hall_id)
+    current = stored.version
+    versions = [
+        {
+            "version": s.version,
+            "current": s.version == current,
+            "published_at": s.updated_at.isoformat(),
+            "created_at": s.created_at.isoformat(),
+            **s.plan["summary"],
+        }
+        for s in store.versions(hall_id)
+    ]
+    return {"hall_id": hall_id, "current_version": current, "versions": versions, "count": len(versions)}
+
+
+@app.post(
+    "/halls/version-diff",
+    status_code=status.HTTP_200_OK,
+    tags=["halls"],
+    summary="Rehearse the diff between two published versions (read-only)",
+)
+def version_diff(body: VersionDiffIn) -> Any:
+    """Compare two *existing published* versions of the **same** hall.
+
+    Returns per-channel command pairs (paired by execution instant; same
+    ``(type, scene_id)`` preferred within an instant) classified as added,
+    removed or changed — level / fade / priority / restore / type deltas are
+    itemised — together with the delivery impact caused by emergency-scene
+    preemption and by each version's publish watermark (commands due before a
+    version was published are never delivered), and whether outstanding
+    (leased/unacked) base tasks would be voided by switching versions.
+
+    The rehearsal is rejected when either referenced version does not exist
+    (404), when the two references name different halls (422 ``hall_mismatch``)
+    or when both reference the same version (422 ``same_version``). It is a
+    pure read: the current orchestration, delivery queues, heads and leases are
+    never modified.
+    """
+    refs = (body.base, body.target)
+
+    # 1) The two references must describe one hall.
+    if body.base.hall_id != body.target.hall_id:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "ok": False,
+                "message": "Version comparison rejected; the two versions must belong to the same hall.",
+                "errors": [
+                    {
+                        "code": "hall_mismatch",
+                        "message": (
+                            f"base references hall '{body.base.hall_id}' but target references "
+                            f"hall '{body.target.hall_id}'."
+                        ),
+                        "base_hall_id": body.base.hall_id,
+                        "target_hall_id": body.target.hall_id,
+                    }
+                ],
+            },
+        )
+
+    # 2) Comparing a version with itself is meaningless.
+    if body.base.version == body.target.version:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "ok": False,
+                "message": "Version comparison rejected; base and target must be different versions.",
+                "errors": [
+                    {
+                        "code": "same_version",
+                        "hall_id": body.base.hall_id,
+                        "version": body.base.version,
+                        "message": f"Both references point at version {body.base.version} of '{body.base.hall_id}'.",
+                    }
+                ],
+            },
+        )
+
+    # 3) Both versions must exist (both problems are reported at once).
+    missing = [
+        {"which": which, "hall_id": ref.hall_id, "version": ref.version,
+         "code": "version_not_found",
+         "message": f"Hall '{ref.hall_id}' has no retained published version {ref.version}."}
+        for which, ref in (("base", refs[0]), ("target", refs[1]))
+        if store.get_version(ref.hall_id, ref.version) is None
+    ]
+    if missing:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "message": "Version comparison rejected; one or both versions do not exist.",
+                "errors": missing,
+            },
+        )
+
+    base_stored = store.get_version(body.base.hall_id, body.base.version)
+    target_stored = store.get_version(body.target.hall_id, body.target.version)
+    assert base_stored is not None and target_stored is not None
+    now = utc_now()
+
+    # Read-only snapshots of the live queues (None for superseded versions);
+    # nothing in delivery is created, advanced or invalidated.
+    base_side = Side(
+        hall_id=base_stored.spec.id,
+        version=base_stored.version,
+        plan=base_stored.plan,
+        published_at=base_stored.updated_at,
+        view=delivery.version_view(base_stored),
+        now=now,
+        created_at=base_stored.created_at,
+        updated_at=base_stored.updated_at,
+    )
+    target_side = Side(
+        hall_id=target_stored.spec.id,
+        version=target_stored.version,
+        plan=target_stored.plan,
+        published_at=target_stored.updated_at,
+        view=delivery.version_view(target_stored),
+        now=now,
+        created_at=target_stored.created_at,
+        updated_at=target_stored.updated_at,
+    )
+    return diff_plans(base_side, target_side)
 
 
 @app.post(

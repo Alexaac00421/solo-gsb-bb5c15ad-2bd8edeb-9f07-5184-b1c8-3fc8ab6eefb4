@@ -21,7 +21,13 @@ class StoredHall:
 
 class HallStore:
     def __init__(self, lock: threading.RLock | None = None) -> None:
+        # hall -> the currently published StoredHall. Kept as the authoritative
+        # "current" map (and for back-compat with code/tests reaching in directly).
         self._halls: dict[str, StoredHall] = {}
+        # hall -> {version: StoredHall} for every version ever published and not
+        # deleted. Version-diff dry runs read historical plans from here; the
+        # delivery layer still only ever serves the current version's queue.
+        self._versions: dict[str, dict[int, StoredHall]] = {}
         # Shared with the DeliveryManager so publish/delete and claim/confirm
         # serialise in one critical section (never two locks => no deadlock).
         self._lock = lock if lock is not None else threading.RLock()
@@ -56,6 +62,7 @@ class HallStore:
                 version=(prev.version + 1) if prev else 1,
             )
             self._halls[spec.id] = stored
+            self._versions.setdefault(spec.id, {})[stored.version] = stored
             if self._listener is not None:
                 self._listener.on_persist(stored, now)
         return stored, None
@@ -141,6 +148,7 @@ class HallStore:
                     version=(prev.version + 1) if prev else 1,
                 )
                 self._halls[hall_id] = stored
+                self._versions.setdefault(hall_id, {})[stored.version] = stored
                 stored_list.append(stored)
                 if self._listener is not None:
                     # Each hall in a batch gets its own version watermark at the
@@ -152,6 +160,17 @@ class HallStore:
         with self._lock:
             return self._halls.get(hall_id)
 
+    def get_version(self, hall_id: str, version: int) -> StoredHall | None:
+        """Read-only fetch of a specific still-retained published version."""
+        with self._lock:
+            return self._versions.get(hall_id, {}).get(version)
+
+    def versions(self, hall_id: str) -> list[StoredHall]:
+        """Every retained published version of a hall, oldest first."""
+        with self._lock:
+            history = self._versions.get(hall_id)
+            return [history[v] for v in sorted(history)] if history else []
+
     def list(self) -> list[StoredHall]:
         with self._lock:
             return list(self._halls.values())
@@ -159,6 +178,9 @@ class HallStore:
     def delete(self, hall_id: str) -> bool:
         with self._lock:
             existed = self._halls.pop(hall_id, None) is not None
+            # Deleting a hall drops its whole history: old versions may no
+            # longer be compared and their leases are invalidated below.
+            self._versions.pop(hall_id, None)
             if existed and self._listener is not None:
                 self._listener.on_delete(hall_id)
             return existed

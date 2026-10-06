@@ -1,0 +1,4 @@
+{
+  "base":   {"hall_id": "bronze-gallery", "version": 1},
+  "target": {"hall_id": "bronze-gallery", "version": 2}
+}
