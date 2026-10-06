@@ -18,9 +18,11 @@ def iso(y, mo, d, h, mi=0, s=0):
 @pytest.fixture(autouse=True)
 def _clear():
     store._halls.clear()
+    store.clear_history()
     delivery.clear()
     yield
     store._halls.clear()
+    store.clear_history()
     delivery.clear()
 
 

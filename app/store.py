@@ -22,6 +22,11 @@ class StoredHall:
 class HallStore:
     def __init__(self, lock: threading.RLock | None = None) -> None:
         self._halls: dict[str, StoredHall] = {}
+        # Immutable snapshots of every successfully published version, kept so
+        # operators can rehearse a diff between two already-published versions
+        # without touching the current orchestration/queue. Keyed
+        # hall_id -> version -> snapshot; cleared when the hall is deleted.
+        self._history: dict[str, dict[int, StoredHall]] = {}
         # Shared with the DeliveryManager so publish/delete and claim/confirm
         # serialise in one critical section (never two locks => no deadlock).
         self._lock = lock if lock is not None else threading.RLock()
@@ -56,9 +61,14 @@ class HallStore:
                 version=(prev.version + 1) if prev else 1,
             )
             self._halls[spec.id] = stored
+            self._archive(stored)
             if self._listener is not None:
                 self._listener.on_persist(stored, now)
         return stored, None
+
+    def _archive(self, stored: StoredHall) -> None:
+        """Retain an immutable snapshot of one published version (lock held)."""
+        self._history.setdefault(stored.spec.id, {})[stored.version] = stored
 
     @staticmethod
     def version_conflict(hall_id: str, expected: int | None, current: int | None) -> dict:
@@ -141,6 +151,7 @@ class HallStore:
                     version=(prev.version + 1) if prev else 1,
                 )
                 self._halls[hall_id] = stored
+                self._archive(stored)
                 stored_list.append(stored)
                 if self._listener is not None:
                     # Each hall in a batch gets its own version watermark at the
@@ -152,16 +163,33 @@ class HallStore:
         with self._lock:
             return self._halls.get(hall_id)
 
+    def get_version(self, hall_id: str, version: int) -> StoredHall | None:
+        """Return an immutable published-version snapshot, or None if absent."""
+        with self._lock:
+            return self._history.get(hall_id, {}).get(version)
+
     def list(self) -> list[StoredHall]:
         with self._lock:
             return list(self._halls.values())
 
+    def list_versions(self, hall_id: str) -> list[int]:
+        with self._lock:
+            return sorted(self._history.get(hall_id, {}))
+
     def delete(self, hall_id: str) -> bool:
         with self._lock:
             existed = self._halls.pop(hall_id, None) is not None
+            # A deleted hall has no versions to compare; recreating the id later
+            # starts a fresh history (matching the delivery queue semantics).
+            self._history.pop(hall_id, None)
             if existed and self._listener is not None:
                 self._listener.on_delete(hall_id)
             return existed
+
+    def clear_history(self) -> None:
+        """Reset retained version snapshots (tests only)."""
+        with self._lock:
+            self._history.clear()
 
 
 store = HallStore()

@@ -8,13 +8,22 @@ from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
 from .delivery import DeliveryManager
-from .models import AckIn, BatchPublishIn, ClaimIn, HallIn, as_utc
+from .diff import diff_versions
+from .models import (
+    AckIn,
+    BatchPublishIn,
+    ClaimIn,
+    HallIn,
+    VersionDiffIn,
+    VersionDiffRequestIn,
+    as_utc,
+)
 from .simulator import simulate
 from .store import StoredHall, store
 
 app = FastAPI(
     title="Museum Lighting Orchestration API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Compile scheduled light scenes into an executable per-channel timeline. "
         "Validates lamp references, brightness ranges and non-overlapping fade intervals; "
@@ -286,6 +295,143 @@ def get_state(
     stored = _stored_or_404(hall_id)
     t = as_utc(at) if at is not None else datetime.now(timezone.utc)
     return simulate(stored.plan, t)
+
+
+# --------------------------------------------------------------------------- #
+# Version comparison rehearsal (read-only)
+# --------------------------------------------------------------------------- #
+def _diff_error(status_code: int, code: str, message: str, **extra: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"ok": False, "code": code, "message": message, **extra},
+    )
+
+
+def _version_snapshot_or_error(hall_id: str, version: int) -> StoredHall | JSONResponse:
+    if store.get(hall_id) is None:
+        return _diff_error(
+            status.HTTP_404_NOT_FOUND,
+            "hall_not_found",
+            f"Hall '{hall_id}' does not exist.",
+            hall_id=hall_id,
+        )
+    snapshot = store.get_version(hall_id, version)
+    if snapshot is None:
+        available = store.list_versions(hall_id)
+        return _diff_error(
+            status.HTTP_404_NOT_FOUND,
+            "version_not_found",
+            f"Hall '{hall_id}' has no version {version}.",
+            hall_id=hall_id,
+            requested_version=version,
+            available_versions=available,
+            current_version=available[-1] if available else None,
+        )
+    return snapshot
+
+
+def _diff_rehearsal(hall_id: str, base_version: int, target_version: int) -> Any:
+    if base_version == target_version:
+        return _diff_error(
+            422,
+            "same_version",
+            "Base and target version must be different; comparing a version with itself yields no rehearsal.",
+            hall_id=hall_id,
+            base_version=base_version,
+            target_version=target_version,
+        )
+
+    before = _version_snapshot_or_error(hall_id, base_version)
+    if isinstance(before, JSONResponse):
+        return before
+    after = _version_snapshot_or_error(hall_id, target_version)
+    if isinstance(after, JSONResponse):
+        return after
+    return diff_versions(before, after)
+
+
+@app.post(
+    "/halls/{hall_id}/versions/diff",
+    status_code=status.HTTP_200_OK,
+    tags=["rehearsal"],
+    summary="Rehearse the diff of two already-published versions of one hall (read-only)",
+)
+def diff_hall_versions(hall_id: str, body: VersionDiffIn) -> Any:
+    """Compare two retained, already-published versions of ``hall_id``.
+
+    Commands are paired by **channel and execution time** and reported as
+    ``added`` / ``removed`` / ``changed`` (brightness, fade duration and
+    priority, plus related command-type/scene changes). Every entry carries the
+    delivery impact observed in that published version: emergency
+    enter/exit traffic and normal activations skipped because they fell inside
+    an emergency window (``emergency_preemption*``), and commands that were
+    never queued because their execution time preceded that version's publish
+    watermark (``publish_watermark_filtered``).
+
+    The endpoint is a pure rehearsal: it never republishes, never changes the
+    delivery queues/leases and never increments a version. A missing hall/
+    version is a 404; identical version numbers are a 422.
+    """
+    if store.get(hall_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "hall_not_found", "message": f"Hall '{hall_id}' does not exist."},
+        )
+    return _diff_rehearsal(hall_id, body.base_version, body.target_version)
+
+
+@app.post(
+    "/version-diff",
+    status_code=status.HTTP_200_OK,
+    tags=["rehearsal"],
+    summary="Rehearse two version references; rejects references to different halls",
+)
+def diff_version_refs(body: VersionDiffRequestIn) -> Any:
+    """Variant of the rehearsal that carries both hall ids explicitly.
+
+    Use this form when comparing version references passed around by operators:
+    if the two references point at different halls the request is rejected with
+    422 ``hall_mismatch`` and nothing is compared. All other rejection and
+    output semantics are identical to ``POST /halls/{hall_id}/versions/diff``.
+    """
+    if body.before.hall_id != body.after.hall_id:
+        return _diff_error(
+            422,
+            "hall_mismatch",
+            "Both versions must belong to the same hall; "
+            f"got hall '{body.before.hall_id}' (v{body.before.version}) and "
+            f"hall '{body.after.hall_id}' (v{body.after.version}).",
+            before_hall_id=body.before.hall_id,
+            after_hall_id=body.after.hall_id,
+        )
+    hall_id = body.before.hall_id
+    if body.before.version == body.after.version:
+        return _diff_error(
+            422,
+            "same_version",
+            "Base and target version must be different; comparing a version with itself yields no rehearsal.",
+            hall_id=hall_id,
+            base_version=body.before.version,
+            target_version=body.after.version,
+        )
+
+    before = _version_snapshot_or_error(hall_id, body.before.version)
+    if isinstance(before, JSONResponse):
+        return before
+    after = _version_snapshot_or_error(hall_id, body.after.version)
+    if isinstance(after, JSONResponse):
+        return after
+    return diff_versions(before, after)
+
+
+@app.get(
+    "/halls/{hall_id}/versions",
+    tags=["rehearsal"],
+    summary="List retained published version numbers for a hall",
+)
+def list_hall_versions(hall_id: str) -> dict:
+    _stored_or_404(hall_id)
+    return {"hall_id": hall_id, "versions": store.list_versions(hall_id)}
 
 
 @app.post(

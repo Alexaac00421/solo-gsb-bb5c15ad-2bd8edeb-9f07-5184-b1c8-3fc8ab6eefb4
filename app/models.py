@@ -122,3 +122,40 @@ class AckIn(BaseModel):
 
     task_id: Annotated[str, Field(min_length=1, max_length=160, examples=["bronze-gallery:v1:lamp-case-1:000000"])]
     lease_token: Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class VersionDiffIn(BaseModel):
+    """Operator request to rehearse the diff of two already-published versions.
+
+    Both version numbers must identify retained snapshots of the *same* hall
+    and must differ; the request is read-only and never republishes anything.
+    """
+
+    base_version: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Existing published version used as the 'before' side of the comparison.",
+        ),
+    ]
+    target_version: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Existing published version used as the 'after' side of the comparison.",
+        ),
+    ]
+
+
+class VersionRefIn(BaseModel):
+    """One side of a cross-reference version rehearsal (``POST /version-diff``)."""
+
+    hall_id: Annotated[str, Field(min_length=1, max_length=64, examples=["bronze-gallery"])]
+    version: Annotated[int, Field(ge=1, description="Existing published version number.")]
+
+
+class VersionDiffRequestIn(BaseModel):
+    """Two version references to compare; the hall ids must resolve to one hall."""
+
+    before: VersionRefIn
+    after: VersionRefIn

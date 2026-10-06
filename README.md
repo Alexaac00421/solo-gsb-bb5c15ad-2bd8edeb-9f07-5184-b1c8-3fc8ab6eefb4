@@ -54,6 +54,9 @@ pytest -q
 | `GET` | `/halls/{hall_id}` | 获取编译后的完整计划 |
 | `GET` | `/halls/{hall_id}/timeline` | 只取每通道可执行时间线 |
 | `GET` | `/halls/{hall_id}/state?at=...` | 模拟某时刻各通道的实际亮度/生效场景 |
+| `GET` | `/halls/{hall_id}/versions` | 列出该厅保留的已发布版本号 |
+| `POST` | `/halls/{hall_id}/versions/diff` | **两个已发布版本的差异预演（只读）**：按通道+执行时间配对，标注新增/移除/亮度/渐变/优先级变化及投递影响 |
+| `POST` | `/version-diff` | 同上，但两个版本引用各自带 `hall_id`，展厅不一致直接拒绝 |
 | `POST` | `/halls/{hall_id}/commands/claim` | **网关按通道领取已到期指令**（租约 + 稳定任务标识） |
 | `POST` | `/halls/{hall_id}/commands/ack` | **凭当前租约令牌确认一条指令**（重复确认幂等） |
 | `GET` | `/halls/{hall_id}/delivery` | 查看每通道投递/租约进度（运维视图） |
@@ -286,6 +289,178 @@ curl -sS -X POST http://localhost:8080/halls/batch-publish \
 
 ---
 
+## 已发布版本对比预演（运营只读）
+
+运营人员在决定「把某展厅从旧版本切到新版本会发生什么」时，可以对**同一展厅的两个已存在版本号**做一次纯只读预演。服务会保留每次成功发布的不可变版本快照（`PUT` 与批量发布都会归档；删除展厅时一并清空），预演直接对比这两份快照：
+
+- **按通道（灯具）+ 执行时间 `at` 配对**时间线指令：
+  - 只在旧版本存在 → `removed`；只在新版本存在 → `added`；
+  - 两侧都有 → `changed`，逐条列出 `brightness`（`to_level`，带 `delta`）、`fade_seconds`（带 `delta`）、`priority` 的变化；命令类型（普通 `fade` ↔ 紧急 `emergency_enter/exit`）、场景 `scene_id`、恢复目标 `restored_scene_id` 等关联变化也会列出。
+  - 同一时刻同一通道若存在多条指令，先按**相同类型**配对，剩余的再跨类型配对（跨类型配对即表现为命令类型/优先级变化）。
+- **投递影响标注**（每条变更的 `delivery_impacts[]`，并在汇总里计数）：
+  - `emergency_preemption`：该指令是紧急 `enter/exit`，执行期间普通场景投递被抢占（含紧急场景 ID、恢复目标等）；
+  - `emergency_preemption_skipped`：普通场景在紧急窗口内到点，被编译期跳过、从不投递也不恢复（见 `activation_changes[]`）；
+  - `publish_watermark_filtered`：指令执行时间早于**该版本自己的发布水位**，该版本的投递队列里根本没有这条指令（历史指令不补发）。
+- 通道整体的新增/移除、`default_level` 变化，以及每次紧急抢占窗口（`preemption_changes[]`：恢复场景、恢复亮度、被跳过场景列表的变化）单独给出。
+- `delivery_preview` 给出两侧版本各自的指令总数、可投递数、水位过滤数、紧急指令数等，**基于每个版本发布时刻的真实水位**计算。
+
+预演**不会重新发布、不产生新版本、不修改当前编排，也不触碰投递队列与租约**（不签发/失效任何令牌），可安全重复、双向调用（交换两个版本号即反向 diff）。
+
+### 拒绝条件
+
+| 情况 | 状态码 | `code` |
+| --- | --- | --- |
+| 展厅不存在 | 404 | `hall_not_found` |
+| 展厅存在但某个版本号不存在 | 404 | `version_not_found`（附 `available_versions` / `current_version`） |
+| 两个版本号相同 | 422 | `same_version` |
+| `/version-diff` 两侧 `hall_id` 不一致 | 422 | `hall_mismatch` |
+| 版本号 < 1 / 缺字段等请求体形状错误 | 422 | FastAPI 校验错误 |
+
+### 15. 预演：版本 1 → 版本 2 的新增/移除/亮度/渐变变化与投递影响
+
+示例请求体：[`examples/version-diff.json`](examples/version-diff.json)。
+
+```bash
+# 先发布两次，得到版本 1 和版本 2（PUT 或 batch-publish 均可）
+curl -sS -X PUT http://localhost:8080/halls/bronze-gallery \
+  -H 'Content-Type: application/json' --data @examples/bronze-gallery.json >/dev/null
+curl -sS -X PUT http://localhost:8080/halls/bronze-gallery \
+  -H 'Content-Type: application/json' --data @examples/bronze-gallery-v2.json >/dev/null
+
+# 查看可选版本
+curl -sS http://localhost:8080/halls/bronze-gallery/versions
+# {"hall_id":"bronze-gallery","versions":[1,2]}
+
+# 只读预演：base=旧（before），target=新（after）
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/versions/diff \
+  -H 'Content-Type: application/json' \
+  --data @examples/version-diff.json | jq
+```
+
+响应结构（基于上面两个示例文件的真实输出节选；具体计数随发布时刻而变）：
+
+```json
+{
+  "ok": true,
+  "read_only": true,
+  "hall_id": "bronze-gallery",
+  "direction": "before_to_after",
+  "generated_at": "2026-10-06T12:00:00+00:00",
+  "before": {"hall_id": "bronze-gallery", "version": 1, "published_at": "2026-10-06T07:00:00+00:00"},
+  "after":  {"hall_id": "bronze-gallery", "version": 2, "published_at": "2026-10-06T12:00:00+00:00"},
+  "summary": {
+    "commands_added": 1,
+    "commands_removed": 0,
+    "commands_changed": 13,
+    "brightness_changes": 5,
+    "fade_changes": 2,
+    "priority_changes": 0,
+    "channels_added": 0,
+    "channels_removed": 0,
+    "delivery_impacts_total": 21,
+    "delivery_impacts_watermark_filtered": 9,
+    "delivery_impacts_emergency_preemption": 12
+  },
+  "channels": {"added": [], "removed": [], "default_level_changes": []},
+  "delivery_preview": {
+    "before": {"version": 1, "published_at": "2026-10-06T07:00:00+00:00",
+               "commands_total": 13, "commands_deliverable": 13, "commands_watermark_filtered": 0,
+               "emergency_commands": 4, "preemptions": 2, "skipped_scene_activations": 0},
+    "after":  {"version": 2, "published_at": "2026-10-06T12:00:00+00:00",
+               "commands_total": 14, "commands_deliverable": 7, "commands_watermark_filtered": 7,
+               "emergency_commands": 4, "preemptions": 2, "skipped_scene_activations": 0}
+  },
+  "command_changes": [
+    {
+      "channel": "lamp-case-1",
+      "at": "2026-10-06T08:00:00+00:00",
+      "kind": "changed",
+      "before": {"version": 1, "deliverable": true, "watermark_filtered": false, "command": {"type": "fade", "to_level": 60.0, "fade_seconds": 300.0, "priority": "normal", "scene_id": "morning-open"}},
+      "after":  {"version": 2, "deliverable": false, "watermark_filtered": true,  "command": {"type": "fade", "to_level": 55.0, "fade_seconds": 600.0, "priority": "normal", "scene_id": "morning-open"}},
+      "changes": [
+        {"field": "brightness", "before": 60.0, "after": 55.0, "delta": -5.0},
+        {"field": "fade_seconds", "before": 300.0, "after": 600.0, "delta": 300.0}
+      ],
+      "delivery_impacts": [
+        {"code": "publish_watermark_filtered", "side": "after", "version": 2,
+         "at": "2026-10-06T08:00:00+00:00", "deliverable": false,
+         "message": "Command due at ... precedes version 2's publish watermark ...; that version's delivery queue never contained it."}
+      ]
+    },
+    {
+      "channel": "lamp-wash",
+      "at": "2026-10-06T16:30:00+00:00",
+      "kind": "added",
+      "after": {"version": 2, "deliverable": true, "watermark_filtered": false,
+                "command": {"type": "fade", "to_level": 20.0, "fade_seconds": 60.0, "priority": "normal", "scene_id": "guest-lecture-dim"}},
+      "delivery_impacts": []
+    }
+  ],
+  "activation_changes": [],
+  "preemption_changes": [
+    {
+      "kind": "changed",
+      "channel": "lamp-case-1",
+      "at": "2026-10-06T10:00:00+00:00",
+      "emergency_scene_id": "conservation-alert",
+      "before": {"version": 1, "restored_scene_id": "morning-open", "restored_level": 60.0},
+      "after":  {"version": 2, "restored_scene_id": "morning-open", "restored_level": 55.0},
+      "changes": [{"field": "restored_level", "before": 60.0, "after": 55.0}]
+    }
+  ]
+}
+```
+
+> 若新版本让某个普通场景改为在紧急窗口内到点（被编译期跳过），该场景会出现在 `activation_changes[]`：
+
+```json
+{
+  "kind": "added",
+  "channel": "lamp-case-1",
+  "at": "2026-10-06T10:15:00+00:00",
+  "scene_id": "visitor-flash",
+  "after": {"preempted_by": "conservation-alert"},
+  "delivery_impacts": [
+    {"code": "emergency_preemption_skipped", "side": "after", "version": 2,
+     "emergency_scene_id": "conservation-alert", "deliverable": false,
+     "message": "Normal scene 'visitor-flash' ... is due ... inside emergency scene 'conservation-alert'; it is never delivered and is not resumed afterwards."}
+  ]
+}
+```
+
+要点：
+
+- `command_changes[]` 已按 `(channel, at, kind)` 排序；`before`/`after` 两侧视图各自带 `version`、`deliverable`、`watermark_filtered` 与完整 `command`。
+- **水位是按各版本自己的发布时刻算的**：上面 v2 在 12:00 发布，其 08:00/10:00 的历史指令即使时间线里存在也**不会投递**（`watermark_filtered: true` + 影响标注）；12:00 整点到点的指令属于新版本（半开区间，可投递）。
+- 紧急 `enter/exit` 的新增/移除/变化都会带 `emergency_preemption`；「紧急窗口内到点被跳过」的普通场景出现在 `activation_changes[]` 并带 `emergency_preemption_skipped`。
+- 预演可任意重复或反向调用；调用前后 `GET /halls/{id}`、`GET /halls/{id}/delivery` 以及网关手里的租约完全不变。
+
+### 16. 拒绝：版本不存在 / 版本相同 / 展厅不一致
+
+```bash
+# 版本号不存在 -> 404，附该厅当前可选版本
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/versions/diff \
+  -H 'Content-Type: application/json' -d '{"base_version":1,"target_version":99}'
+# {"ok": false, "code": "version_not_found", "hall_id": "bronze-gallery",
+#  "requested_version": 99, "available_versions": [1, 2], "current_version": 2}
+
+# 两个版本号相同 -> 422
+curl -sS -X POST http://localhost:8080/halls/bronze-gallery/versions/diff \
+  -H 'Content-Type: application/json' -d '{"base_version":2,"target_version":2}'
+# {"ok": false, "code": "same_version", ...}
+
+# 显式版本引用形式：两侧展厅不一致 -> 422 hall_mismatch
+curl -sS -X POST http://localhost:8080/version-diff -H 'Content-Type: application/json' -d '{
+  "before": {"hall_id": "bronze-gallery", "version": 1},
+  "after":  {"hall_id": "porcelain-hall", "version": 2}
+}'
+# {"ok": false, "code": "hall_mismatch", "before_hall_id": "bronze-gallery", "after_hall_id": "porcelain-hall"}
+```
+
+删除展厅会同时丢弃它的版本快照与当前编排；之后重建同名展厅从版本 1 重新归档（与投递水位/旧令牌失效语义一致）。
+
+---
+
 ## 网关投递：按通道领取 / 确认到期指令（租约队列）
 
 灯光网关（DMX/调光网关）通过两个接口把**已发布版本**的指令拉到设备上执行。投递是**按通道（灯具）**、**按执行时间顺序**的严格 FIFO，并在其外叠加一层「租约 / 可见性超时」：
@@ -462,15 +637,19 @@ app/
   clock.py      # 可注入 UTC 时钟（生产读墙钟，测试可冻结/推进时间）
   engine.py     # 纯函数：校验 + 时间线合成（抢占/恢复/跳过）
   simulator.py  # 任意时刻的通道状态模拟
-  store.py      # 线程安全内存存储：单展厅 put 与批量原子 batch_commit（乐观版本检查）
+  store.py      # 线程安全内存存储：单展厅 put 与批量原子 batch_commit（乐观版本检查），并归档不可变版本快照
+  diff.py       # 纯函数：两个已发布版本的只读差异预演（配对 + 亮度/渐变/优先级变化 + 水位/抢占投递影响）
   delivery.py   # 网关投递队列：按通道 FIFO、租约/令牌、发布水位与版本失效
-  main.py       # FastAPI 路由（单展厅 + 批量发布 + commands/claim、commands/ack、delivery）
+  main.py       # FastAPI 路由（单展厅 + 批量发布 + versions/diff 预演 + commands/claim、commands/ack、delivery）
 tests/
   test_api.py       # 34 个端到端用例（单展厅 + 批量发布，含并发）
   test_delivery.py  # 23 个网关投递用例（领取/租约/确认/版本失效/并发）
+  test_diff.py      # 17 个已发布版本对比预演用例（配对/变化/水位/抢占/拒绝/只读不变性）
 examples/
   bronze-gallery.json
+  bronze-gallery-v2.json  # 版本对比预演用的第二个已发布版本
   batch-publish.json   # 批量发布请求示例（更新 + 新建）
+  version-diff.json    # 版本对比预演请求示例（base_version + target_version）
   gateway-claim.json   # 网关领取请求体
   gateway-ack.json     # 网关确认请求体（task_id + lease_token）
 Dockerfile

@@ -35,9 +35,11 @@ class FakeClock:
 @pytest.fixture(autouse=True)
 def _isolate():
     store._halls.clear()
+    store.clear_history()
     delivery.clear()
     yield
     store._halls.clear()
+    store.clear_history()
     delivery.clear()
 
 
