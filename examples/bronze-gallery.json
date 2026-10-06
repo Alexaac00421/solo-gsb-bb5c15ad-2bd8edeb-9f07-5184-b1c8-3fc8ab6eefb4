@@ -1,0 +1,59 @@
+{
+  "id": "bronze-gallery",
+  "name": "Bronze Gallery",
+  "lamps": [
+    {"id": "lamp-case-1", "name": "Display case row 1", "default_level": 0},
+    {"id": "lamp-case-2", "name": "Display case row 2", "default_level": 0},
+    {"id": "lamp-wash",    "name": "Wall wash",          "default_level": 10}
+  ],
+  "scenes": [
+    {
+      "id": "morning-open",
+      "name": "Morning opening",
+      "priority": "normal",
+      "start_at": "2026-10-06T08:00:00Z",
+      "end_at":   "2026-10-06T12:00:00Z",
+      "items": [
+        {"lamp_id": "lamp-case-1", "level": 60, "fade_seconds": 300},
+        {"lamp_id": "lamp-case-2", "level": 55, "fade_seconds": 300},
+        {"lamp_id": "lamp-wash",   "level": 35, "fade_seconds": 600}
+      ]
+    },
+    {
+      "id": "noon-bright",
+      "name": "Noon bright",
+      "priority": "normal",
+      "start_at": "2026-10-06T12:00:00Z",
+      "end_at":   "2026-10-06T18:00:00Z",
+      "items": [
+        {"lamp_id": "lamp-case-1", "level": 90, "fade_seconds": 120},
+        {"lamp_id": "lamp-case-2", "level": 90, "fade_seconds": 120},
+        {"lamp_id": "lamp-wash",   "level": 70, "fade_seconds": 120}
+      ]
+    },
+    {
+      "id": "evening-dim",
+      "name": "Evening dim",
+      "priority": "normal",
+      "start_at": "2026-10-06T18:00:00Z",
+      "end_at":   "2026-10-06T21:00:00Z",
+      "items": [
+        {"lamp_id": "lamp-case-1", "level": 30, "fade_seconds": 900},
+        {"lamp_id": "lamp-case-2", "level": 30, "fade_seconds": 900},
+        {"lamp_id": "lamp-wash",   "level": 15, "fade_seconds": 900}
+      ]
+    },
+    {
+      "id": "conservation-alert",
+      "name": "Conservation light alarm",
+      "priority": "emergency",
+      "start_at": "2026-10-06T10:00:00Z",
+      "end_at":   "2026-10-06T10:30:00Z",
+      "notes": "Ambient light spike: drop exhibit lighting to protection level.",
+      "items": [
+        {"lamp_id": "lamp-case-1", "level": 5, "fade_seconds": 0, "restore_fade_seconds": 180},
+        {"lamp_id": "lamp-case-2", "level": 5, "fade_seconds": 0, "restore_fade_seconds": 180}
+      ]
+    }
+  ]
+}

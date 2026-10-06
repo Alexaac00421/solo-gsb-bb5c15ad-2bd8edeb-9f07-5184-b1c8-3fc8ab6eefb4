@@ -1,0 +1,18 @@
+services:
+  lighting-api:
+    build: .
+    image: museum-lighting-api:latest
+    container_name: museum-lighting-api
+    ports:
+      - "8080:8080"
+    environment:
+      # Single worker keeps the in-memory store consistent; swap for a shared
+      # store (Redis/DB) if horizontal scaling is required.
+      UVICORN_WORKERS: "1"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://127.0.0.1:8080/health'))['status']=='ok' else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

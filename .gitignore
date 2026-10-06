@@ -1,0 +1,11 @@
+# Python virtual environments (local test/dev)
+.venv/
+venv/
+
+# Bytecode caches
+__pycache__/
+*.py[cod]
+
+# pytest / coverage caches
+.pytest_cache/
+.coverage
